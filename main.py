@@ -1,26 +1,63 @@
 import os
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from groq import Groq
+import psycopg2
+from urllib.parse import urlparse
 
-app = FastAPI()
-client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+# Leer la URL de la base de datos que Railway inyecta automáticamente
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
-class PromptModel(BaseModel):
-    prompt: str
+def obtener_conexion():
+    """Crea una conexión segura con la base de datos PostgreSQL en Railway."""
+    return psycopg2.connect(DATABASE_URL, sslmode='require')
 
-@app.post("/api/v1/chat")
-def procesar_chat(data: PromptModel):
+def inicializar_base_datos():
+    """Crea la tabla de memoria si no existe."""
+    conn = obtener_conexion()
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS chat_history (
+            id SERIAL PRIMARY KEY,
+            session_id VARCHAR(255) NOT NULL,
+            role VARCHAR(50) NOT NULL,
+            message TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+# Ejecutar esto al arrancar tu servidor
+inicializar_base_datos()
+
+def guardar_mensaje(session_id, role, message):
+    """Guarda un mensaje en la base de datos de la nube."""
     try:
-        chat_completion = client.chat.completions.create(
-            messages=[
-                {"role": "system", "content": "Eres el núcleo de inteligencia de un asistente local en Windows. Responde de forma directa, precisa y concisa."},
-                {"role": "user", "content": data.prompt}
-            ],
-            model="llama-3.3-70b-versatile",
-            temperature=0.3,
+        conn = obtener_conexion()
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO chat_history (session_id, role, message) VALUES (%s, %s, %s)",
+            (session_id, role, message)
         )
-        respuesta = chat_completion.choices[0].message.content
-        return {"response": respuesta}
+        conn.commit()
+        cursor.close()
+        conn.close()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"Error guardando en BD: {e}")
+
+def obtener_historial(session_id, limite=10):
+    """Recupera los últimos mensajes de la sesión para darle contexto a la IA."""
+    try:
+        conn = obtener_conexion()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT role, message FROM chat_history WHERE session_id = %s ORDER BY created_at DESC LIMIT %s",
+            (session_id, limite)
+        )
+        filas = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        # Invertir para que queden en orden cronológico
+        return [{"role": r[0], "content": r[1]} for r in reversed(filas)]
+    except Exception as e:
+        print(f"Error leyendo BD: {e}")
+        return []
